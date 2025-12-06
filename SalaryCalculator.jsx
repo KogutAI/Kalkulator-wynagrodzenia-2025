@@ -1,0 +1,579 @@
+import React, { useState, useMemo } from 'react';
+import { Calculator, Coins, Briefcase, UserCheck, AlertCircle, Info, ArrowRightLeft, GraduationCap, Building2, HeartPulse, Ambulance } from 'lucide-react';
+
+const SalaryCalculator = () => {
+  // Stan aplikacji
+  const [amount, setAmount] = useState(10000);
+  const [inputType, setInputType] = useState('gross'); // 'gross' (brutto) lub 'net' (netto)
+  
+  // Parametry
+  const [isUnder26, setIsUnder26] = useState(false);
+  const [isStudent, setIsStudent] = useState(false); // Status studenta
+  const [hasOtherJob, setHasOtherJob] = useState(false); // Inny pracodawca (>= min krajowa)
+  const [isSicknessInsurance, setIsSicknessInsurance] = useState(false); // Dobrowolne chorobowe (Zlecenie/B2B)
+  const [accidentRate, setAccidentRate] = useState(1.67); // Ubezpieczenie wypadkowe (B2B)
+  const [b2bCosts, setB2bCosts] = useState(''); // Koszty prowadzenia działalności (domyślnie puste)
+  const [b2bZusType, setB2bZusType] = useState('full'); // 'full', 'start', 'preference'
+
+  // Stałe podatkowe (uproszczone na 2024/2025)
+  const CONSTANTS = {
+    minWage: 4300,
+    zus: {
+      emerytalne: 0.0976,
+      rentowe: 0.015,
+      chorobowe: 0.0245,
+      zdrowotne: 0.09,
+    },
+    tax: {
+      scaleRate: 0.12,
+      scaleThreshold: 120000,
+      linearRate: 0.19,
+      kupZlecenie: 0.20,
+      kupDzielo: 0.20, // Standardowe
+      kupUoP: 250,     // Standardowe miesięczne koszty uzyskania przychodu
+      kwotaWolnaMies: 300, // 3600 rocznie / 12
+    },
+    b2b: {
+      bases: {
+        full: 4694.40,      // Duży ZUS
+        preference: 1290,   // Mały ZUS
+        start: 0            // Ulga na start
+      },
+      rates: {
+        pension: 0.1952,
+        disability: 0.08,
+        laborFund: 0.0245,
+        sickness: 0.0245,
+      },
+      healthBaseLinear: 0.049,
+      healthBaseScale: 0.09,
+    }
+  };
+
+  // --- Funkcje Obliczeniowe (Brutto -> Netto) ---
+
+  // 1. Umowa o Pracę
+  const calculateUoP = (gross) => {
+    const zusEmerytalne = gross * CONSTANTS.zus.emerytalne;
+    const zusRentowe = gross * CONSTANTS.zus.rentowe;
+    const zusChorobowe = gross * CONSTANTS.zus.chorobowe; 
+    const socialContrib = zusEmerytalne + zusRentowe + zusChorobowe;
+
+    const healthBase = gross - socialContrib;
+    const zusZdrowotne = healthBase * CONSTANTS.zus.zdrowotne;
+
+    const taxBase = Math.round(healthBase - CONSTANTS.tax.kupUoP);
+    
+    let tax = 0;
+    if (!isUnder26) {
+        tax = (taxBase * CONSTANTS.tax.scaleRate) - CONSTANTS.tax.kwotaWolnaMies;
+        tax = Math.max(0, Math.round(tax));
+    } else {
+        tax = 0;
+    }
+
+    const net = gross - socialContrib - zusZdrowotne - tax;
+
+    return {
+      type: 'Umowa o pracę',
+      gross: gross,
+      net: net,
+      zus: socialContrib + zusZdrowotne,
+      pit: tax,
+      details: {
+        social: socialContrib,
+        health: zusZdrowotne
+      }
+    };
+  };
+
+  // 2. Umowa Zlecenie
+  const calculateZlecenie = (gross) => {
+    let base = gross;
+    let zusEmerytalne = 0;
+    let zusRentowe = 0;
+    let zusChorobowe = 0; 
+    let zusZdrowotne = 0;
+    let tax = 0;
+
+    const isZusExempt = isStudent && isUnder26;
+
+    if (!isZusExempt) {
+        if (!hasOtherJob) {
+            zusEmerytalne = base * CONSTANTS.zus.emerytalne;
+            zusRentowe = base * CONSTANTS.zus.rentowe;
+            if (isSicknessInsurance) {
+                zusChorobowe = base * CONSTANTS.zus.chorobowe;
+            }
+        }
+    }
+
+    const socialContrib = zusEmerytalne + zusRentowe + zusChorobowe;
+    const healthBase = base - socialContrib;
+
+    if (!isZusExempt) {
+        zusZdrowotne = healthBase * CONSTANTS.zus.zdrowotne;
+    }
+
+    const kupBase = healthBase; 
+    const kup = kupBase * CONSTANTS.tax.kupZlecenie;
+    const taxBase = Math.round(healthBase - kup);
+    
+    if (!isUnder26) {
+        tax = Math.max(0, Math.round(taxBase * CONSTANTS.tax.scaleRate));
+    }
+
+    const net = base - socialContrib - zusZdrowotne - tax;
+
+    return {
+      type: 'Umowa zlecenie',
+      gross: base,
+      net: net,
+      zus: socialContrib + zusZdrowotne,
+      pit: tax,
+      details: {
+        social: socialContrib,
+        health: zusZdrowotne
+      }
+    };
+  };
+
+  // 3. Umowa o Dzieło
+  const calculateDzielo = (gross) => {
+    const kupRate = 0.20; 
+    const kup = gross * kupRate;
+    const taxBase = Math.round(gross - kup);
+    const tax = Math.round(taxBase * CONSTANTS.tax.scaleRate);
+    const net = gross - tax;
+
+    return {
+      type: 'Umowa o dzieło',
+      gross: gross,
+      net: net,
+      zus: 0,
+      pit: tax,
+      details: {
+        social: 0,
+        health: 0
+      }
+    };
+  };
+
+  // 4. B2B (Skala)
+  const calculateB2B = (grossInvoice) => {
+    let base = 0;
+    let payLaborFund = false;
+
+    if (b2bZusType === 'full') {
+        base = CONSTANTS.b2b.bases.full;
+        payLaborFund = true;
+    } else if (b2bZusType === 'preference') {
+        base = CONSTANTS.b2b.bases.preference;
+        payLaborFund = false; 
+    } else {
+        base = 0; 
+    }
+
+    // Zabezpieczenie na wypadek pustego pola (traktuj jako 0)
+    const currentAccidentRate = accidentRate === '' ? 0 : accidentRate;
+    const currentCosts = b2bCosts === '' ? 0 : b2bCosts;
+
+    const pension = base * CONSTANTS.b2b.rates.pension;
+    const disability = base * CONSTANTS.b2b.rates.disability;
+    const accident = base * (currentAccidentRate / 100); 
+    const laborFund = payLaborFund ? (base * CONSTANTS.b2b.rates.laborFund) : 0;
+    const sickness = isSicknessInsurance ? (base * CONSTANTS.b2b.rates.sickness) : 0;
+
+    const socialZus = pension + disability + accident + laborFund + sickness;
+
+    const income = grossInvoice - currentCosts - socialZus;
+    
+    let healthZus = Math.max(381, income * CONSTANTS.b2b.healthBaseScale);
+    if (income < 0) healthZus = 381;
+
+    const taxBase = Math.round(income); 
+    
+    let tax = (taxBase * CONSTANTS.tax.scaleRate) - CONSTANTS.tax.kwotaWolnaMies;
+    tax = Math.max(0, Math.round(tax));
+
+    const net = grossInvoice - socialZus - healthZus - tax - currentCosts;
+
+    return {
+      type: 'B2B (Skala 12%/32%)',
+      gross: grossInvoice,
+      net: net,
+      zus: socialZus + healthZus,
+      pit: tax,
+      details: {
+        social: socialZus,
+        health: healthZus
+      }
+    };
+  };
+
+  // --- Solver dla Netto -> Brutto ---
+  const findGrossFromNet = (targetNet, calculationFunction) => {
+    let low = targetNet;
+    let high = targetNet * 2.5; 
+    let attempts = 0;
+    let result = null;
+
+    while (attempts < 30) {
+      const mid = (low + high) / 2;
+      result = calculationFunction(mid);
+      
+      if (Math.abs(result.net - targetNet) < 1) {
+        return mid;
+      }
+      
+      if (result.net < targetNet) {
+        low = mid;
+      } else {
+        high = mid;
+      }
+      attempts++;
+    }
+    return (low + high) / 2;
+  };
+
+  // --- Główna logika przeliczania ---
+  const results = useMemo(() => {
+    // Zabezpieczenie: jeśli pole puste, traktuj jako 0
+    const safeAmount = amount === '' ? 0 : amount;
+    
+    let grossAmounts = {
+      uop: safeAmount,
+      zlecenie: safeAmount,
+      dzielo: safeAmount,
+      b2b: safeAmount
+    };
+
+    if (inputType === 'net') {
+      grossAmounts.uop = findGrossFromNet(safeAmount, calculateUoP);
+      grossAmounts.zlecenie = findGrossFromNet(safeAmount, calculateZlecenie);
+      grossAmounts.dzielo = findGrossFromNet(safeAmount, calculateDzielo);
+      grossAmounts.b2b = findGrossFromNet(safeAmount, calculateB2B);
+    }
+
+    return {
+      uop: calculateUoP(grossAmounts.uop),
+      zlecenie: calculateZlecenie(grossAmounts.zlecenie),
+      dzielo: calculateDzielo(grossAmounts.dzielo),
+      b2b: calculateB2B(grossAmounts.b2b)
+    };
+  }, [amount, inputType, isUnder26, isStudent, hasOtherJob, b2bCosts, b2bZusType, isSicknessInsurance, accidentRate]);
+
+  const formatPLN = (val) => new Intl.NumberFormat('pl-PL', { style: 'currency', currency: 'PLN', maximumFractionDigits: 0 }).format(val);
+
+  // Helper do obsługi inputów numerycznych (pozwala na puste pole)
+  const handleNumberChange = (setter) => (e) => {
+    const val = e.target.value;
+    setter(val === '' ? '' : Number(val));
+  };
+
+  return (
+    <div className="max-w-6xl mx-auto p-4 md:p-6 bg-slate-50 min-h-screen font-sans text-slate-800">
+      
+      {/* Header */}
+      <div className="mb-8 text-center">
+        <h1 className="text-3xl font-bold text-blue-900 flex items-center justify-center gap-3">
+          <Calculator className="w-8 h-8" />
+          Kalkulator Wynagrodzeń 2025
+        </h1>
+        <p className="text-slate-500 mt-2">Porównanie: Umowa o Pracę, Zlecenie, Dzieło i B2B (Skala)</p>
+      </div>
+
+      {/* Input Section */}
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 mb-6">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+          
+          {/* Main Input */}
+          <div>
+            <label className="block text-sm font-semibold text-slate-700 mb-2">
+              Wprowadź kwotę (PLN)
+            </label>
+            <div className="relative">
+              <input 
+                type="number" 
+                value={amount} 
+                onChange={handleNumberChange(setAmount)}
+                className="w-full text-2xl font-bold p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none pl-4"
+                placeholder="0"
+              />
+              <span className="absolute right-4 top-4 text-slate-400 font-medium">PLN</span>
+            </div>
+
+            <div className="flex bg-slate-100 p-1 rounded-lg mt-4">
+              <button 
+                onClick={() => setInputType('gross')}
+                className={`flex-1 py-2 text-sm font-medium rounded-md transition-all ${inputType === 'gross' ? 'bg-white shadow text-blue-700' : 'text-slate-500 hover:text-slate-700'}`}
+              >
+                Kwota Brutto
+              </button>
+              <button 
+                onClick={() => setInputType('net')}
+                className={`flex-1 py-2 text-sm font-medium rounded-md transition-all ${inputType === 'net' ? 'bg-white shadow text-blue-700' : 'text-slate-500 hover:text-slate-700'}`}
+              >
+                Kwota Netto
+              </button>
+            </div>
+            
+            {inputType === 'net' && (
+               <div className="mt-2 text-xs text-amber-600 flex items-center gap-1">
+                 <Info className="w-3 h-3" />
+                 Obliczenie przybliżonej kwoty brutto potrzebnej do uzyskania tego netto.
+               </div>
+            )}
+          </div>
+
+          {/* Configuration */}
+          <div className="space-y-3">
+            <h3 className="text-sm font-semibold text-slate-700 border-b pb-2">Parametry</h3>
+            
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {/* Age */}
+                <label className="flex items-center justify-between cursor-pointer group hover:bg-slate-50 p-1 rounded transition-colors">
+                <span className="text-slate-600 flex items-center gap-2">
+                    <UserCheck className="w-4 h-4 text-blue-600" /> 
+                    <div className="flex flex-col">
+                    <span className="text-sm font-medium">Wiek poniżej 26 lat</span>
+                    <span className="text-[10px] text-slate-400 font-normal">Ulga dla młodych (PIT 0%)</span>
+                    </div>
+                </span>
+                <input 
+                    type="checkbox" 
+                    checked={isUnder26} 
+                    onChange={(e) => setIsUnder26(e.target.checked)}
+                    className="w-5 h-5 text-blue-600 rounded focus:ring-blue-500" 
+                />
+                </label>
+
+                {/* Student */}
+                <label className="flex items-center justify-between cursor-pointer group hover:bg-slate-50 p-1 rounded transition-colors">
+                <span className="text-slate-600 flex items-center gap-2">
+                    <GraduationCap className="w-4 h-4 text-blue-600" /> 
+                    <div className="flex flex-col">
+                        <span className="text-sm font-medium">Status studenta</span>
+                        <span className="text-[10px] text-slate-400 font-normal">
+                            Brak ZUS przy zleceniu
+                        </span>
+                    </div>
+                </span>
+                <input 
+                    type="checkbox" 
+                    checked={isStudent} 
+                    onChange={(e) => setIsStudent(e.target.checked)}
+                    className="w-5 h-5 text-blue-600 rounded focus:ring-blue-500" 
+                />
+                </label>
+
+                {/* Sickness Insurance */}
+                <label className="flex items-center justify-between cursor-pointer group hover:bg-slate-50 p-1 rounded transition-colors">
+                <span className="text-slate-600 flex items-center gap-2">
+                    <HeartPulse className="w-4 h-4 text-rose-500" /> 
+                    <div className="flex flex-col">
+                        <span className="text-sm font-medium">Dobrowolne chorobowe</span>
+                        <span className="text-[10px] text-slate-400 font-normal">
+                            Dla Zlecenia i B2B
+                        </span>
+                    </div>
+                </span>
+                <input 
+                    type="checkbox" 
+                    checked={isSicknessInsurance} 
+                    onChange={(e) => setIsSicknessInsurance(e.target.checked)}
+                    className="w-5 h-5 text-rose-500 rounded focus:ring-rose-500" 
+                />
+                </label>
+
+                {/* Other Job */}
+                <label className="flex items-center justify-between cursor-pointer group hover:bg-slate-50 p-1 rounded transition-colors">
+                <span className="text-slate-600 flex items-center gap-2">
+                    <Briefcase className="w-4 h-4 text-blue-600" /> 
+                    <div className="flex flex-col">
+                    <span className="text-sm font-medium">Inny pracodawca</span>
+                    <span className="text-[10px] text-slate-400 font-normal">Płacisz tylko zdrowotną (Zlec.)</span>
+                    </div>
+                </span>
+                <input 
+                    type="checkbox" 
+                    checked={hasOtherJob} 
+                    onChange={(e) => setHasOtherJob(e.target.checked)}
+                    className="w-5 h-5 text-blue-600 rounded focus:ring-blue-500" 
+                />
+                </label>
+            </div>
+
+             {/* B2B Config */}
+             <div className="pt-2 border-t mt-2">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div className="flex-1">
+                        <span className="text-xs text-slate-500 font-medium block mb-1">Rodzaj ZUS</span>
+                        <select 
+                            value={b2bZusType}
+                            onChange={(e) => setB2bZusType(e.target.value)}
+                            className="w-full text-sm border rounded p-1.5 bg-white outline-none focus:ring-1 focus:ring-blue-300"
+                        >
+                            <option value="full">Duży ZUS</option>
+                            <option value="preference">Preferencyjny</option>
+                            <option value="start">Ulga na start</option>
+                        </select>
+                    </div>
+                    <div className="flex-1">
+                        <span className="text-xs text-slate-500 font-medium block mb-1">Koszty</span>
+                        <input 
+                            type="number"
+                            value={b2bCosts}
+                            onChange={handleNumberChange(setB2bCosts)}
+                            className="w-full text-sm border rounded p-1.5 text-right outline-none focus:ring-1 focus:ring-blue-300"
+                            placeholder="0"
+                        />
+                    </div>
+                    <div className="flex-1 relative">
+                        <span className="text-xs text-slate-500 font-medium block mb-1 flex items-center gap-1">
+                             Wypadkowe (%)
+                             <Ambulance className="w-3 h-3 text-red-400" />
+                        </span>
+                        <input 
+                            type="number"
+                            step="0.01"
+                            value={accidentRate}
+                            onChange={handleNumberChange(setAccidentRate)}
+                            className="w-full text-sm border rounded p-1.5 text-right outline-none focus:ring-1 focus:ring-blue-300"
+                            placeholder="1.67"
+                        />
+                    </div>
+                </div>
+             </div>
+
+          </div>
+        </div>
+      </div>
+
+      {/* Results Grid */}
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+        
+        {/* UoP Card */}
+        <ResultCard 
+          result={results.uop} 
+          icon={<Building2 className="w-5 h-5 text-indigo-600" />}
+          colorClass="border-indigo-200 bg-indigo-50/50"
+          titleClass="text-indigo-800"
+          badge="Etat"
+        />
+
+        {/* Zlecenie Card */}
+        <ResultCard 
+          result={results.zlecenie} 
+          icon={<Coins className="w-5 h-5 text-emerald-600" />}
+          colorClass="border-emerald-200 bg-emerald-50/50"
+          titleClass="text-emerald-800"
+          badge="Umowa Cywilnoprawna"
+        />
+
+        {/* Dzielo Card */}
+        <ResultCard 
+          result={results.dzielo} 
+          icon={<Briefcase className="w-5 h-5 text-purple-600" />}
+          colorClass="border-purple-200 bg-purple-50/50"
+          titleClass="text-purple-800"
+          badge="Przekazanie Dzieła"
+        />
+
+        {/* B2B Card */}
+        <ResultCard 
+          result={results.b2b} 
+          icon={<ArrowRightLeft className="w-5 h-5 text-blue-600" />}
+          colorClass="border-blue-200 bg-blue-50/50"
+          titleClass="text-blue-800"
+          badge="Samozatrudnienie"
+        />
+
+      </div>
+
+      {/* Summary / Analysis */}
+      <div className="mt-8 bg-white p-6 rounded-xl border border-slate-200 shadow-sm">
+        <h3 className="text-lg font-bold text-slate-800 mb-4">Wnioski i Porównanie</h3>
+        <ul className="space-y-3 text-sm text-slate-600">
+             <li className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-indigo-500 mt-1 shrink-0" />
+                <span>
+                    <strong>Umowa o Pracę:</strong> Ubezpieczenie chorobowe jest tu obowiązkowe (2.45%), co daje prawo do płatnego zwolnienia lekarskiego (L4). Składkę wypadkową w całości płaci pracodawca, więc nie wpływa na Twoje netto.
+                </span>
+            </li>
+            <li className="flex items-start gap-2">
+                <HeartPulse className="w-4 h-4 text-rose-500 mt-1 shrink-0" />
+                <span>
+                    <strong>Chorobowe (Zlecenie/B2B):</strong>
+                    {isSicknessInsurance 
+                     ? ' Zaznaczyłeś dobrowolne ubezpieczenie chorobowe. Twoje netto jest niższe, ale masz prawo do płatnego L4 (po okresie wyczekiwania).'
+                     : ' Nie zaznaczyłeś ubezpieczenia chorobowego. Twoje netto jest wyższe, ale w razie choroby nie otrzymasz zasiłku (L4).'}
+                </span>
+            </li>
+            <li className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-blue-500 mt-1 shrink-0" />
+                <span>
+                    <strong>B2B (Skala):</strong> Na zasadach ogólnych płacisz 9% zdrowotnej (nieodliczalnej) oraz podatek według skali. Wysokość ZUS zależy od wybranej podstawy (Duży/Mały) oraz wprowadzonej stopy wypadkowej.
+                </span>
+            </li>
+        </ul>
+      </div>
+
+    </div>
+  );
+};
+
+const ResultCard = ({ result, icon, colorClass, titleClass, badge }) => {
+    const formatPLN = (val) => new Intl.NumberFormat('pl-PL', { style: 'currency', currency: 'PLN', maximumFractionDigits: 0 }).format(val);
+    
+    return (
+        <div className={`rounded-xl border shadow-sm p-4 flex flex-col h-full bg-white transition-all hover:shadow-md relative overflow-hidden`}>
+            <div className={`absolute top-0 left-0 w-full h-1 ${colorClass.replace('bg-', 'bg-').replace('/50', '')}`}></div>
+
+            <div className="flex justify-between items-start mb-3">
+                <div>
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">{badge}</span>
+                    <h2 className={`text-base font-bold ${titleClass} flex items-center gap-2 truncate`}>
+                        {icon}
+                        <span className="truncate">{result.type}</span>
+                    </h2>
+                </div>
+            </div>
+
+            <div className="mb-4 text-center py-3 rounded-lg bg-slate-50 border border-slate-100">
+                <p className="text-[10px] text-slate-500 font-medium uppercase tracking-wide mb-1">Kwota Netto (Na rękę)</p>
+                <p className={`text-2xl font-extrabold ${titleClass}`}>
+                    {formatPLN(result.net)}
+                </p>
+            </div>
+
+            <div className="space-y-2 text-xs flex-1">
+                <div className="flex justify-between items-center text-slate-600 py-1 border-b border-slate-100">
+                    <span>Brutto/Faktura:</span>
+                    <span className="font-semibold">{formatPLN(result.gross)}</span>
+                </div>
+                
+                <div className="flex justify-between items-center text-slate-500 py-1 border-b border-slate-100">
+                    <span>Składki społeczne:</span>
+                    <span className="font-semibold text-slate-700">-{formatPLN(result.details.social)}</span>
+                </div>
+
+                <div className="flex justify-between items-center text-slate-500 py-1 border-b border-slate-100">
+                    <span>Składka zdrowotna:</span>
+                    <span className="font-semibold text-slate-700">-{formatPLN(result.details.health)}</span>
+                </div>
+
+                <div className="flex justify-between items-center text-slate-500 py-1 border-b border-slate-100">
+                    <span>Zaliczka PIT:</span>
+                    <span className="font-semibold text-slate-700">-{formatPLN(result.pit)}</span>
+                </div>
+            </div>
+
+            <div className="mt-3 pt-2 text-[10px] text-center text-slate-400">
+                Podatki i ZUS łącznie: {Math.round(((result.zus + result.pit) / result.gross) * 100)}%
+            </div>
+        </div>
+    );
+};
+
+export default SalaryCalculator;
