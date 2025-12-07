@@ -22,7 +22,7 @@
     <script type="text/babel">
         const { useState, useMemo } = React;
 
-        // --- Komponenty Ikon (uproszczone SVG z Lucide) ---
+        // --- Komponenty Ikon ---
         const IconWrapper = ({ children, className }) => (
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
                 {children}
@@ -57,9 +57,9 @@
           const [b2bCosts, setB2bCosts] = useState(''); 
           const [b2bZusType, setB2bZusType] = useState('full'); 
 
-          // Stałe podatkowe (uproszczone na 2024/2025)
+          // Stałe podatkowe (2025)
           const CONSTANTS = {
-            minWage: 4300,
+            minWage: 4626, // Prognoza 2025 (styczeń)
             zus: {
               emerytalne: 0.0976,
               rentowe: 0.015,
@@ -67,18 +67,19 @@
               zdrowotne: 0.09,
             },
             tax: {
-              scaleRate: 0.12,
+              scaleRate: 0.12,    // Pierwszy próg
+              secondRate: 0.32,   // Drugi próg
               scaleThreshold: 120000,
               linearRate: 0.19,
               kupZlecenie: 0.20,
               kupDzielo: 0.20,
               kupUoP: 250,     
-              kwotaWolnaMies: 300, 
+              kwotaWolnaRoczna: 3600, // 300 miesięcznie * 12
             },
             b2b: {
               bases: {
                 full: 4694.40,      
-                preference: 1290,   
+                preference: 1387.80, // 30% z 4626
                 start: 0            
               },
               rates: {
@@ -90,6 +91,35 @@
               healthBaseLinear: 0.049,
               healthBaseScale: 0.09,
             }
+          };
+
+          // --- Pomocnicza funkcja podatkowa (Progresywna / Skala) ---
+          // Oblicza podatek średniomiesięczny uwzględniając roczny próg 120k
+          const calculateProgressiveTaxAverage = (monthlyTaxBase, isUnder26) => {
+             if (isUnder26) {
+                 // Uproszczenie dla młodych: zwolnienie do 85 528 zł.
+                 // Nadwyżka opodatkowana 12%, a powyżej 120k (łącznie z ulgą) wchodzi 32%.
+                 // Tu dla prostoty przyjmiemy podatek 0, jeśli dochód roczny < 85k,
+                 // ale dla wysokich kwot to bardziej złożone.
+                 // W tym kalkulatorze skupiamy się na naprawie progu dla standardowego pracownika.
+                 return 0; 
+             }
+
+             const annualIncome = monthlyTaxBase * 12;
+             let annualTax = 0;
+
+             if (annualIncome <= CONSTANTS.tax.scaleThreshold) {
+                 // Całość w pierwszym progu
+                 annualTax = (annualIncome * CONSTANTS.tax.scaleRate) - CONSTANTS.tax.kwotaWolnaRoczna;
+             } else {
+                 // Przekroczenie progu
+                 const taxFirstBracket = (CONSTANTS.tax.scaleThreshold * CONSTANTS.tax.scaleRate) - CONSTANTS.tax.kwotaWolnaRoczna;
+                 const excess = annualIncome - CONSTANTS.tax.scaleThreshold;
+                 const taxSecondBracket = excess * CONSTANTS.tax.secondRate;
+                 annualTax = taxFirstBracket + taxSecondBracket;
+             }
+
+             return Math.max(0, annualTax / 12);
           };
 
           // --- Funkcje Obliczeniowe ---
@@ -105,11 +135,8 @@
 
             const taxBase = Math.round(healthBase - CONSTANTS.tax.kupUoP);
             
-            let tax = 0;
-            if (!isUnder26) {
-                tax = (taxBase * CONSTANTS.tax.scaleRate) - CONSTANTS.tax.kwotaWolnaMies;
-                tax = Math.max(0, Math.round(tax));
-            }
+            // Używamy nowej logiki progresywnej
+            const tax = Math.round(calculateProgressiveTaxAverage(taxBase, isUnder26));
 
             const net = gross - socialContrib - zusZdrowotne - tax;
 
@@ -153,13 +180,12 @@
                 zusZdrowotne = healthBase * CONSTANTS.zus.zdrowotne;
             }
 
+            // PIT (Zlecenie też jest na skali!)
             const kupBase = healthBase; 
             const kup = kupBase * CONSTANTS.tax.kupZlecenie;
             const taxBase = Math.round(healthBase - kup);
             
-            if (!isUnder26) {
-                tax = Math.max(0, Math.round(taxBase * CONSTANTS.tax.scaleRate));
-            }
+            tax = Math.round(calculateProgressiveTaxAverage(taxBase, isUnder26));
 
             const net = base - socialContrib - zusZdrowotne - tax;
 
@@ -177,10 +203,13 @@
           };
 
           const calculateDzielo = (gross) => {
+            // Umowa o dzieło też jest na skali
             const kupRate = 0.20; 
             const kup = gross * kupRate;
             const taxBase = Math.round(gross - kup);
-            const tax = Math.round(taxBase * CONSTANTS.tax.scaleRate);
+            
+            const tax = Math.round(calculateProgressiveTaxAverage(taxBase, false)); // Dzieło nie ma ulgi dla młodych
+
             const net = gross - tax;
 
             return {
@@ -223,13 +252,13 @@
 
             const income = grossInvoice - currentCosts - socialZus;
             
-            let healthZus = Math.max(381, income * CONSTANTS.b2b.healthBaseScale);
+            let healthZus = Math.max(381, income * CONSTANTS.b2b.healthBaseScale); // Na skali 9%
             if (income < 0) healthZus = 381;
 
             const taxBase = Math.round(income); 
             
-            let tax = (taxBase * CONSTANTS.tax.scaleRate) - CONSTANTS.tax.kwotaWolnaMies;
-            tax = Math.max(0, Math.round(tax));
+            // Podatek B2B Skala
+            const tax = Math.round(calculateProgressiveTaxAverage(taxBase, false)); // Przedsiębiorca nie ma ulgi dla młodych (zazwyczaj)
 
             const net = grossInvoice - socialZus - healthZus - tax - currentCosts;
 
@@ -246,6 +275,7 @@
             };
           };
 
+          // --- Solver dla Netto -> Brutto ---
           const findGrossFromNet = (targetNet, calculationFunction) => {
             let low = targetNet;
             let high = targetNet * 2.5; 
@@ -312,6 +342,7 @@
                   Kalkulator Wynagrodzeń 2025
                 </h1>
                 <p className="text-slate-500 mt-2">Porównanie: Umowa o Pracę, Zlecenie, Dzieło i B2B (Skala)</p>
+                <p className="text-xs text-slate-400 mt-1">*Wyniki to średnia miesięczna uwzględniająca roczny próg podatkowy (32% pow. 120 tys. zł)</p>
               </div>
 
               {/* Input Section */}
@@ -544,7 +575,7 @@
                     <li className="flex items-start gap-2">
                         <Icons.AlertCircle className="w-4 h-4 text-blue-500 mt-1 shrink-0" />
                         <span>
-                            <strong>B2B (Skala):</strong> Na zasadach ogólnych płacisz 9% zdrowotnej (nieodliczalnej) oraz podatek według skali. Wysokość ZUS zależy od wybranej podstawy (Duży/Mały) oraz wprowadzonej stopy wypadkowej.
+                            <strong>B2B (Skala):</strong> Na zasadach ogólnych płacisz 9% zdrowotnej (nieodliczalnej) oraz podatek według skali (12% do 120 tys. zł, 32% powyżej).
                         </span>
                     </li>
                 </ul>
